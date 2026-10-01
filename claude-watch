@@ -1,0 +1,1095 @@
+#!/usr/bin/env python3
+"""claude-watch: know when a Claude Code session is waiting on you.
+
+Claude Code fires a `Notification` hook whenever a session stalls on a
+permission prompt, an idle prompt, or an MCP dialog. This utility registers
+itself on that hook (plus a few lifecycle events), keeps a record of which
+sessions are blocked and for how long, and sends a macOS notification, re-notifying
+while a session stays blocked.
+
+  claude-watch install      register the hooks in ~/.claude/settings.json
+  claude-watch status       what is waiting on you right now
+  claude-watch log          history of waits, with how long each one took
+  claude-watch focus <n>    bring a blocked session's terminal to the front
+
+Run `claude-watch help` for the full list.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+SELF = Path(__file__).resolve()
+HOME = Path.home()
+WATCH_HOME = Path(os.environ.get("CLAUDE_WATCH_HOME", HOME / ".claude-watch"))
+STATE_PATH = WATCH_HOME / "state.json"
+CONFIG_PATH = WATCH_HOME / "config.json"
+EVENTS_PATH = WATCH_HOME / "events.jsonl"
+ERROR_PATH = WATCH_HOME / "errors.log"
+LOCK_PATH = WATCH_HOME / "lock"
+WAITING_MARKER = WATCH_HOME / "waiting"
+
+SETTINGS_PATH = HOME / ".claude" / "settings.json"
+LAUNCH_AGENT_LABEL = "com.taylorarndt.claude-watch"
+LAUNCH_AGENT_PATH = HOME / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+
+# Notification types that mean a human has to do something. Everything else
+# Claude Code can emit is informational.
+WAITING_TYPES = {
+    "permission_prompt",
+    "idle_prompt",
+    "agent_needs_input",
+    "elicitation_dialog",
+    "elicitation_url_dialog",
+    "quota_auto_resume_stale",
+    "quota_auto_resume_disabled",
+}
+
+TITLES = {
+    "permission_prompt": "Claude needs approval",
+    "idle_prompt": "Claude is waiting for you",
+    "agent_needs_input": "Claude needs input",
+    "elicitation_dialog": "MCP server needs input",
+    "elicitation_url_dialog": "MCP server needs a browser",
+    "elicitation_complete": "MCP elicitation complete",
+    "elicitation_response": "MCP elicitation answered",
+    "agent_completed": "Claude finished",
+    "auth_success": "Claude signed in",
+    "quota_auto_resume_fired": "Claude resumed",
+    "quota_auto_resume_stale": "Claude paused, press Enter",
+    "quota_auto_resume_disabled": "Claude stopped waiting",
+}
+
+DEFAULT_CONFIG = {
+    # Which notification types produce a desktop notification.
+    "notify": {
+        "permission_prompt": True,
+        "idle_prompt": True,
+        "agent_needs_input": True,
+        "agent_completed": True,
+        "elicitation_dialog": True,
+        "elicitation_url_dialog": True,
+        "elicitation_complete": False,
+        "elicitation_response": False,
+        "auth_success": False,
+        "quota_auto_resume_fired": True,
+        "quota_auto_resume_stale": True,
+        "quota_auto_resume_disabled": True,
+    },
+    # macOS system sound per type; "" for silent. "default" covers the rest.
+    "sounds": {
+        "permission_prompt": "Ping",
+        "idle_prompt": "Tink",
+        "agent_completed": "Glass",
+        "quota_auto_resume_stale": "Basso",
+        "default": "Ping",
+    },
+    # Speak the notification aloud with `say` as well as showing it.
+    "speak": False,
+    "voice": "",
+    # Re-notify every N seconds while a session stays blocked (0 disables).
+    "renag_seconds": 120,
+    # Give up re-notifying after this many reminders.
+    "renag_max": 4,
+    # "auto" prefers terminal-notifier when installed, else osascript.
+    "notifier": "auto",
+    # Forget sessions we have heard nothing from for this long.
+    "stale_session_seconds": 86400,
+    # Also notify when Claude stops responding, even without an idle_prompt.
+    "notify_on_stop": False,
+}
+
+
+# --------------------------------------------------------------------------
+# config + state
+# --------------------------------------------------------------------------
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        user = json.loads(CONFIG_PATH.read_text())
+    except (OSError, ValueError):
+        return cfg
+    for key, value in user.items():
+        if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+            cfg[key].update(value)
+        else:
+            cfg[key] = value
+    return cfg
+
+
+def _read_state() -> dict:
+    try:
+        state = json.loads(STATE_PATH.read_text())
+    except (OSError, ValueError):
+        state = {}
+    state.setdefault("sessions", {})
+    return state
+
+
+def _write_state(state: dict) -> None:
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_PATH)
+    # A marker file lets the hot-path hooks (PostToolUse) bail out without
+    # taking the lock or parsing state when nothing is blocked.
+    waiting = any(s.get("status") == "waiting" for s in state["sessions"].values())
+    if waiting:
+        WAITING_MARKER.touch()
+    else:
+        WAITING_MARKER.unlink(missing_ok=True)
+
+
+def with_state(mutate=None):
+    """Run `mutate(state)` under an exclusive lock, persisting any changes."""
+    WATCH_HOME.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_PATH, "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            state = _read_state()
+            if mutate is None:
+                return state
+            result = mutate(state)
+            _write_state(state)
+            return result
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def log_event(record: dict) -> None:
+    WATCH_HOME.mkdir(parents=True, exist_ok=True)
+    record.setdefault("at", time.time())
+    with open(EVENTS_PATH, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.write(json.dumps(record) + "\n")
+
+
+# --------------------------------------------------------------------------
+# process / terminal discovery
+# --------------------------------------------------------------------------
+
+def _proc_table() -> dict[int, tuple[int, str, str]]:
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid=,tty=,comm="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table: dict[int, tuple[int, str, str]] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            table[int(parts[0])] = (int(parts[1]), parts[2], parts[3] if len(parts) > 3 else "")
+        except ValueError:
+            continue
+    return table
+
+
+def terminal_identity() -> dict:
+    """Figure out which terminal this hook was fired from.
+
+    Walks up from our own pid: the nearest ancestor with a controlling tty is
+    the terminal we live in, and the nearest `claude` ancestor is the process
+    whose liveness tells us the session still exists.
+    """
+    table = _proc_table()
+    pid = os.getpid()
+    tty = None
+    claude_pid = None
+    for _ in range(12):
+        row = table.get(pid)
+        if row is None:
+            break
+        ppid, raw_tty, comm = row
+        if tty is None and raw_tty not in ("??", "-", ""):
+            tty = raw_tty
+        if claude_pid is None and "claude" in os.path.basename(comm).lower():
+            claude_pid = pid
+        if ppid <= 1:
+            break
+        pid = ppid
+    return {
+        "pid": claude_pid,
+        "tty": f"/dev/{tty}" if tty else None,
+        "term_app": os.environ.get("TERM_PROGRAM", ""),
+        "term_session_id": os.environ.get("TERM_SESSION_ID")
+        or os.environ.get("ITERM_SESSION_ID", ""),
+        "tmux_pane": os.environ.get("TMUX_PANE", ""),
+    }
+
+
+def pid_alive(pid) -> bool:
+    if not pid:
+        return True  # unknown: assume alive, let the staleness sweep handle it
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, OverflowError):
+        return True
+    return True
+
+
+# --------------------------------------------------------------------------
+# notifications
+# --------------------------------------------------------------------------
+
+def _spawn(cmd: list[str]) -> None:
+    """Fire and forget -- a hook must never block Claude Code."""
+    try:
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        _note_error(f"spawn failed: {cmd[0]}: {exc}")
+
+
+def chosen_notifier(cfg: dict) -> str:
+    choice = cfg.get("notifier", "auto")
+    if choice != "auto":
+        return choice
+    return "terminal-notifier" if shutil.which("terminal-notifier") else "osascript"
+
+
+def notify(cfg: dict, *, title: str, subtitle: str, message: str,
+           group: str = "", sound: str = "", click: str = "") -> None:
+    kind = chosen_notifier(cfg)
+    if kind != "none":
+        if kind == "terminal-notifier":
+            cmd = ["terminal-notifier", "-title", title,
+                   "-subtitle", subtitle, "-message", message]
+            if sound:
+                cmd += ["-sound", sound]
+            if group:
+                cmd += ["-group", group]
+            if click:
+                cmd += ["-execute", click]
+        else:
+            # Pass text as argv rather than interpolating it into AppleScript,
+            # so quotes and newlines in a message cannot break the script.
+            script = ("on run argv\n"
+                      "display notification (item 1 of argv) "
+                      "with title (item 2 of argv) subtitle (item 3 of argv)")
+            if sound:
+                script += " sound name (item 4 of argv)"
+            script += "\nend run"
+            cmd = ["osascript", "-e", script, "--", message, title, subtitle]
+            if sound:
+                cmd.append(sound)
+        _spawn(cmd)
+
+    if cfg.get("speak"):
+        spoken = f"{title}. {subtitle}. {message}" if subtitle else f"{title}. {message}"
+        say = ["say"]
+        if cfg.get("voice"):
+            say += ["-v", cfg["voice"]]
+        say.append(spoken)
+        _spawn(say)
+
+
+def sound_for(cfg: dict, ntype: str) -> str:
+    sounds = cfg.get("sounds", {})
+    return sounds.get(ntype, sounds.get("default", ""))
+
+
+def emit(cfg: dict, sess: dict, *, reminder: bool = False) -> None:
+    ntype = sess.get("notification_type", "unknown")
+    title = TITLES.get(ntype, "Claude Code")
+    project = sess.get("project") or "Claude Code"
+    message = (sess.get("message") or "").strip() or title
+
+    subtitle = project
+    if reminder:
+        waited = fmt_duration(time.time() - sess.get("since", time.time()))
+        subtitle = f"{project} (waiting {waited})"
+
+    click = ""
+    if sess.get("session_id"):
+        click = f'{shell_quote(str(SELF))} focus {shell_quote(sess["session_id"])}'
+
+    notify(
+        cfg,
+        title=title,
+        subtitle=subtitle,
+        message=message,
+        group=f"claude-watch-{sess.get('session_id', 'unknown')}",
+        sound=sound_for(cfg, ntype),
+        click=click,
+    )
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _note_error(message: str) -> None:
+    try:
+        WATCH_HOME.mkdir(parents=True, exist_ok=True)
+        with open(ERROR_PATH, "a") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# focusing a terminal
+# --------------------------------------------------------------------------
+
+TERMINAL_FOCUS = '''
+on run argv
+  set theTty to item 1 of argv
+  tell application "Terminal"
+    activate
+    repeat with w in windows
+      repeat with t in tabs of w
+        try
+          if tty of t is theTty then
+            set selected of t to true
+            set frontmost of w to true
+            return "ok"
+          end if
+        end try
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+'''
+
+ITERM_FOCUS = '''
+on run argv
+  set theTty to item 1 of argv
+  tell application "iTerm2"
+    activate
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          try
+            if tty of s is theTty then
+              select w
+              select t
+              select s
+              return "ok"
+            end if
+          end try
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+'''
+
+
+def focus_session(sess: dict) -> str:
+    pane = sess.get("tmux_pane")
+    if pane and shutil.which("tmux"):
+        subprocess.run(["tmux", "select-pane", "-t", pane],
+                       capture_output=True, text=True)
+        subprocess.run(["tmux", "select-window", "-t", pane],
+                       capture_output=True, text=True)
+
+    tty = sess.get("tty")
+    if not tty:
+        return "no tty recorded for this session"
+
+    app = (sess.get("term_app") or "").lower()
+    if "iterm" in app:
+        script = ITERM_FOCUS
+    elif "apple_terminal" in app or not app:
+        script = TERMINAL_FOCUS
+    else:
+        return f"don't know how to focus {sess.get('term_app')}"
+
+    result = subprocess.run(["osascript", "-e", script, "--", tty],
+                            capture_output=True, text=True)
+    out = (result.stdout or result.stderr).strip()
+    return "focused" if out == "ok" else f"could not focus {tty}: {out or 'no match'}"
+
+
+# --------------------------------------------------------------------------
+# the hook entry point
+# --------------------------------------------------------------------------
+
+def _session_defaults(sess: dict, payload: dict) -> None:
+    cwd = payload.get("cwd") or sess.get("cwd") or ""
+    sess["session_id"] = payload.get("session_id", sess.get("session_id", "unknown"))
+    sess["cwd"] = cwd
+    sess["project"] = Path(cwd).name or cwd or "unknown"
+    sess["permission_mode"] = payload.get("permission_mode", sess.get("permission_mode"))
+    sess["transcript_path"] = payload.get("transcript_path", sess.get("transcript_path"))
+    sess["updated"] = time.time()
+    if not sess.get("tty"):
+        sess.update(terminal_identity())
+
+
+def hook_notification(cfg: dict, payload: dict) -> None:
+    ntype = payload.get("notification_type") or "unknown"
+    message = (payload.get("message") or "").strip()
+    now = time.time()
+
+    def mutate(state):
+        sess = state["sessions"].setdefault(payload.get("session_id", "unknown"), {})
+        was_waiting = sess.get("status") == "waiting"
+        previous_type = sess.get("notification_type")
+        _session_defaults(sess, payload)
+        sess["notification_type"] = ntype
+        sess["message"] = message
+
+        if ntype in WAITING_TYPES:
+            if not was_waiting or previous_type != ntype:
+                sess["since"] = now
+                sess["notify_count"] = 0
+            sess["status"] = "waiting"
+            sess["last_notified"] = now
+            sess["notify_count"] = sess.get("notify_count", 0) + 1
+        else:
+            sess["status"] = "idle"
+            sess.pop("since", None)
+            sess["notify_count"] = 0
+        return dict(sess)
+
+    sess = with_state(mutate)
+    log_event({
+        "event": "notification",
+        "notification_type": ntype,
+        "session_id": sess.get("session_id"),
+        "project": sess.get("project"),
+        "cwd": sess.get("cwd"),
+        "message": message,
+        "waiting": ntype in WAITING_TYPES,
+    })
+
+    if cfg["notify"].get(ntype, True):
+        emit(cfg, sess)
+
+
+def hook_resolved(payload: dict, reason: str) -> None:
+    """Something happened that means the session is no longer blocked."""
+    if not WAITING_MARKER.exists():
+        return  # hot path: nothing is blocked, so there is nothing to clear
+    sid = payload.get("session_id", "unknown")
+    now = time.time()
+
+    def mutate(state):
+        sess = state["sessions"].get(sid)
+        if not sess or sess.get("status") != "waiting":
+            return None
+        waited = now - sess.get("since", now)
+        resolved = {
+            "session_id": sid,
+            "project": sess.get("project"),
+            "notification_type": sess.get("notification_type"),
+            "message": sess.get("message"),
+            "waited_seconds": round(waited, 1),
+            "reminders": max(0, sess.get("notify_count", 1) - 1),
+        }
+        sess["status"] = "idle"
+        sess["updated"] = now
+        sess["notify_count"] = 0
+        sess.pop("since", None)
+        return resolved
+
+    resolved = with_state(mutate)
+    if resolved:
+        resolved["event"] = "resolved"
+        resolved["by"] = reason
+        log_event(resolved)
+
+
+def hook_session_start(payload: dict) -> None:
+    def mutate(state):
+        sess = state["sessions"].setdefault(payload.get("session_id", "unknown"), {})
+        sess.update(terminal_identity())
+        _session_defaults(sess, payload)
+        sess["status"] = "idle"
+        sess["started"] = time.time()
+        sess["source"] = payload.get("source", "")
+        sess["model"] = payload.get("model", "")
+        sess["notify_count"] = 0
+        sess.pop("since", None)
+    with_state(mutate)
+
+
+def hook_session_end(payload: dict) -> None:
+    sid = payload.get("session_id", "unknown")
+
+    def mutate(state):
+        return state["sessions"].pop(sid, None)
+
+    sess = with_state(mutate)
+    if sess:
+        log_event({"event": "session_end", "session_id": sid,
+                   "project": sess.get("project"),
+                   "reason": payload.get("reason", "")})
+
+
+def hook_stop(cfg: dict, payload: dict) -> None:
+    hook_resolved(payload, "Stop")
+    if not cfg.get("notify_on_stop"):
+        return
+
+    def mutate(state):
+        sess = state["sessions"].setdefault(payload.get("session_id", "unknown"), {})
+        _session_defaults(sess, payload)
+        sess["notification_type"] = "agent_completed"
+        sess["message"] = "Claude finished responding."
+        return dict(sess)
+
+    emit(cfg, with_state(mutate))
+
+
+def cmd_hook(args: list[str]) -> int:
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        payload = {}
+    event = payload.get("hook_event_name") or (args[0] if args else "")
+    try:
+        cfg = load_config()
+        if event == "Notification":
+            hook_notification(cfg, payload)
+        elif event == "SessionStart":
+            hook_session_start(payload)
+        elif event == "SessionEnd":
+            hook_session_end(payload)
+        elif event == "Stop":
+            hook_stop(cfg, payload)
+        elif event in ("PostToolUse", "UserPromptSubmit", "PreToolUse"):
+            hook_resolved(payload, event)
+    except Exception as exc:  # a broken watcher must never break a session
+        _note_error(f"{event or 'hook'}: {type(exc).__name__}: {exc}")
+    # Stay silent in the transcript, and always succeed.
+    print(json.dumps({"suppressOutput": True}))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# reaping: re-notify long waits, forget dead sessions
+# --------------------------------------------------------------------------
+
+def cmd_reap(args: list[str]) -> int:
+    cfg = load_config()
+    now = time.time()
+    reminders: list[dict] = []
+    dropped: list[tuple[str, dict, str]] = []
+
+    def mutate(state):
+        for sid, sess in list(state["sessions"].items()):
+            if not pid_alive(sess.get("pid")):
+                dropped.append((sid, state["sessions"].pop(sid), "process gone"))
+                continue
+            if now - sess.get("updated", now) > cfg["stale_session_seconds"]:
+                dropped.append((sid, state["sessions"].pop(sid), "stale"))
+                continue
+            if sess.get("status") != "waiting":
+                continue
+            renag = cfg.get("renag_seconds", 0)
+            if not renag:
+                continue
+            if sess.get("notify_count", 0) > cfg.get("renag_max", 0):
+                continue
+            if now - sess.get("last_notified", 0) >= renag:
+                sess["last_notified"] = now
+                sess["notify_count"] = sess.get("notify_count", 0) + 1
+                reminders.append(dict(sess))
+
+    with_state(mutate)
+
+    for sid, sess, why in dropped:
+        log_event({"event": "dropped", "session_id": sid,
+                   "project": sess.get("project"), "reason": why})
+    for sess in reminders:
+        log_event({"event": "reminder", "session_id": sess.get("session_id"),
+                   "project": sess.get("project"),
+                   "notification_type": sess.get("notification_type"),
+                   "waited_seconds": round(now - sess.get("since", now), 1)})
+        emit(cfg, sess, reminder=True)
+
+    if "--verbose" in args:
+        print(f"{len(reminders)} reminder(s), {len(dropped)} session(s) dropped")
+    return 0
+
+
+def cmd_daemon(args: list[str]) -> int:
+    interval = 30
+    if "--interval" in args:
+        interval = max(5, int(args[args.index("--interval") + 1]))
+    print(f"claude-watch daemon: reaping every {interval}s (ctrl-c to stop)")
+    try:
+        while True:
+            cmd_reap([])
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# reporting
+# --------------------------------------------------------------------------
+
+def ordered_sessions(state: dict) -> list[dict]:
+    sessions = list(state["sessions"].values())
+    waiting = [s for s in sessions if s.get("status") == "waiting"]
+    other = [s for s in sessions if s.get("status") != "waiting"]
+    waiting.sort(key=lambda s: s.get("since", 0))
+    other.sort(key=lambda s: (s.get("project") or "", s.get("updated", 0)))
+    return waiting + other
+
+
+def cmd_status(args: list[str]) -> int:
+    state = with_state()
+    sessions = ordered_sessions(state)
+
+    if "--json" in args:
+        print(json.dumps(sessions, indent=2))
+        return 0
+
+    if not sessions:
+        print("No Claude Code sessions tracked.")
+        print("Start a session (or run `claude-watch install` first).")
+        return 0
+
+    now = time.time()
+    waiting = [s for s in sessions if s.get("status") == "waiting"]
+    print(f"{len(waiting)} of {len(sessions)} session(s) waiting on you.\n")
+
+    for index, sess in enumerate(sessions, start=1):
+        if sess.get("status") == "waiting":
+            ntype = sess.get("notification_type", "unknown")
+            waited = fmt_duration(now - sess.get("since", now))
+            head = f"{index}. WAITING {waited}: {TITLES.get(ntype, ntype)}"
+        else:
+            head = f"{index}. ok"
+        print(head)
+        print(f"     project: {sess.get('project') or '?'}  ({sess.get('cwd') or '?'})")
+        if sess.get("status") == "waiting" and sess.get("message"):
+            print(f"     says:    {sess['message']}")
+        bits = []
+        if sess.get("tty"):
+            bits.append(sess["tty"])
+        if sess.get("term_app"):
+            bits.append(sess["term_app"])
+        if sess.get("permission_mode"):
+            bits.append(f"mode={sess['permission_mode']}")
+        if bits:
+            print(f"     where:   {'  '.join(bits)}")
+        print(f"     session: {sess.get('session_id', '?')}")
+        print()
+
+    if waiting:
+        print("Jump to the first one with:  claude-watch focus 1")
+    return 0
+
+
+def cmd_log(args: list[str]) -> int:
+    count = 20
+    for flag in ("-n", "--count"):
+        if flag in args:
+            count = int(args[args.index(flag) + 1])
+    try:
+        lines = EVENTS_PATH.read_text().splitlines()
+    except OSError:
+        print("No history yet.")
+        return 0
+
+    records = []
+    for line in lines[-count * 4:]:
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+
+    if "--json" in args:
+        print(json.dumps(records[-count:], indent=2))
+        return 0
+
+    if not records:
+        print("No history yet.")
+        return 0
+
+    for rec in records[-count:]:
+        when = time.strftime("%m-%d %H:%M:%S", time.localtime(rec.get("at", 0)))
+        project = rec.get("project") or "?"
+        event = rec.get("event")
+        if event == "notification":
+            kind = "waited on" if rec.get("waiting") else "noted"
+            detail = rec.get("message") or rec.get("notification_type", "")
+            print(f"{when}  {project:<22} {kind}: {detail}")
+        elif event == "resolved":
+            waited = fmt_duration(rec.get("waited_seconds", 0))
+            reminders = rec.get("reminders", 0)
+            extra = f", {reminders} reminder(s)" if reminders else ""
+            print(f"{when}  {project:<22} answered after {waited}{extra} "
+                  f"({rec.get('notification_type', '?')})")
+        elif event == "reminder":
+            waited = fmt_duration(rec.get("waited_seconds", 0))
+            print(f"{when}  {project:<22} still waiting ({waited})")
+        elif event == "dropped":
+            print(f"{when}  {project:<22} forgotten ({rec.get('reason')})")
+        elif event == "session_end":
+            print(f"{when}  {project:<22} session ended ({rec.get('reason') or 'n/a'})")
+        else:
+            print(f"{when}  {project:<22} {event}")
+
+    waits = [r.get("waited_seconds", 0) for r in records if r.get("event") == "resolved"]
+    if waits:
+        print(f"\n{len(waits)} answered prompt(s) in this window; "
+              f"longest wait {fmt_duration(max(waits))}, "
+              f"average {fmt_duration(sum(waits) / len(waits))}.")
+    return 0
+
+
+def cmd_focus(args: list[str]) -> int:
+    if not args:
+        print("usage: claude-watch focus <number | session-id | project>")
+        return 2
+    target = args[0]
+    sessions = ordered_sessions(with_state())
+    if not sessions:
+        print("No sessions tracked.")
+        return 1
+
+    match = None
+    if target.isdigit() and 1 <= int(target) <= len(sessions):
+        match = sessions[int(target) - 1]
+    else:
+        for sess in sessions:
+            if sess.get("session_id", "").startswith(target) or sess.get("project") == target:
+                match = sess
+                break
+    if match is None:
+        print(f"No session matching {target!r}. Try `claude-watch status`.")
+        return 1
+
+    print(focus_session(match))
+    return 0
+
+
+def cmd_clear(args: list[str]) -> int:
+    def mutate(state):
+        count = len(state["sessions"])
+        state["sessions"] = {}
+        return count
+    print(f"Cleared {with_state(mutate)} tracked session(s).")
+    return 0
+
+
+def cmd_test(args: list[str]) -> int:
+    cfg = load_config()
+    kind = chosen_notifier(cfg)
+    print(f"Notifier: {kind}" + ("  (speaking too)" if cfg.get("speak") else ""))
+    notify(cfg,
+           title=TITLES["permission_prompt"],
+           subtitle=Path.cwd().name,
+           message="This is a claude-watch test notification.",
+           group="claude-watch-test",
+           sound=sound_for(cfg, "permission_prompt"))
+    print("Sent. If nothing appeared, see the notification-permission note in README.md.")
+    return 0
+
+
+def cmd_config(args: list[str]) -> int:
+    if not CONFIG_PATH.exists():
+        write_default_config()
+    print(f"{CONFIG_PATH}\n")
+    print(CONFIG_PATH.read_text().rstrip())
+    return 0
+
+
+# --------------------------------------------------------------------------
+# install / uninstall
+# --------------------------------------------------------------------------
+
+# (event, matcher). An empty matcher means "every notification type"; "*"
+# means "every tool" on the tool events.
+HOOK_MATCHERS = [
+    ("Notification", ""),
+    ("SessionStart", ""),
+    ("SessionEnd", ""),
+    ("Stop", ""),
+    ("PostToolUse", "*"),
+    ("UserPromptSubmit", ""),
+]
+
+HOOK_COMMAND = f"{shell_quote(str(SELF))} hook"
+
+
+def write_default_config() -> None:
+    WATCH_HOME.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+
+
+def _is_ours(hook: dict) -> bool:
+    command = hook.get("command", "")
+    return "claude-watch" in command and command.rstrip().endswith("hook")
+
+
+def _strip_our_hooks(hooks: dict) -> int:
+    """Remove every hook entry this utility owns. Returns how many it removed."""
+    removed = 0
+    for event in list(hooks.keys()):
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for entry in entries:
+            inner = entry.get("hooks", []) if isinstance(entry, dict) else []
+            mine = [h for h in inner if isinstance(h, dict) and _is_ours(h)]
+            removed += len(mine)
+            theirs = [h for h in inner if h not in mine]
+            if theirs:
+                entry["hooks"] = theirs
+                kept.append(entry)
+            elif not inner:
+                kept.append(entry)
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event)
+    return removed
+
+
+def _load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except ValueError as exc:
+        print(f"error: {SETTINGS_PATH} is not valid JSON ({exc}).")
+        print("Fix or move that file, then run install again.")
+        raise SystemExit(1)
+
+
+def _save_settings(settings: dict) -> None:
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if SETTINGS_PATH.exists():
+        backup = SETTINGS_PATH.with_suffix(f".json.bak.{int(time.time())}")
+        shutil.copy2(SETTINGS_PATH, backup)
+        print(f"Backed up settings to {backup}")
+    tmp = SETTINGS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    tmp.replace(SETTINGS_PATH)
+
+
+def cmd_install(args: list[str]) -> int:
+    settings = _load_settings()
+    hooks = settings.setdefault("hooks", {})
+    _strip_our_hooks(hooks)  # idempotent: re-installing upgrades in place
+
+    for event, matcher in HOOK_MATCHERS:
+        entries = hooks.setdefault(event, [])
+        entries.append({
+            "matcher": matcher,
+            "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": 10}],
+        })
+
+    _save_settings(settings)
+    print(f"Registered {len(HOOK_MATCHERS)} hooks in {SETTINGS_PATH}:")
+    print("  " + ", ".join(event for event, _ in HOOK_MATCHERS))
+
+    if not CONFIG_PATH.exists():
+        write_default_config()
+        print(f"Wrote default config to {CONFIG_PATH}")
+
+    if "--no-daemon" in args:
+        print("\nSkipping the reminder agent (--no-daemon): you will get one "
+              "notification per prompt, with no follow-ups.")
+    else:
+        install_agent()
+
+    if not shutil.which("terminal-notifier"):
+        print("\nTip: `brew install terminal-notifier` gives you clickable "
+              "notifications (clicking one jumps to that terminal window) and "
+              "avoids the Script Editor permission dance.")
+    print("\nOpen a new Claude Code session to pick the hooks up, then run "
+          "`claude-watch status`.")
+    return 0
+
+
+def install_agent() -> None:
+    plist = {
+        "Label": LAUNCH_AGENT_LABEL,
+        "ProgramArguments": [str(SELF), "reap"],
+        "StartInterval": 30,
+        "RunAtLoad": True,
+        "StandardErrorPath": str(WATCH_HOME / "agent.err.log"),
+    }
+    LAUNCH_AGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(LAUNCH_AGENT_PATH, "wb") as fh:
+        plistlib.dump(plist, fh)
+
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", f"{domain}/{LAUNCH_AGENT_LABEL}"],
+                   capture_output=True, text=True)
+    result = subprocess.run(["launchctl", "bootstrap", domain, str(LAUNCH_AGENT_PATH)],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        result = subprocess.run(["launchctl", "load", "-w", str(LAUNCH_AGENT_PATH)],
+                                capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"Loaded reminder agent ({LAUNCH_AGENT_LABEL}): re-notifies every "
+              f"{DEFAULT_CONFIG['renag_seconds']}s while a session stays blocked.")
+    else:
+        print(f"Could not load the reminder agent: "
+              f"{(result.stderr or result.stdout).strip()}")
+        print(f"Run it yourself with: {SELF} daemon")
+
+
+def remove_agent() -> None:
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
+                   capture_output=True, text=True)
+    if LAUNCH_AGENT_PATH.exists():
+        LAUNCH_AGENT_PATH.unlink()
+        print(f"Removed {LAUNCH_AGENT_PATH}")
+
+
+def cmd_uninstall(args: list[str]) -> int:
+    settings = _load_settings()
+    hooks = settings.get("hooks", {})
+    removed = _strip_our_hooks(hooks)
+    if not hooks:
+        settings.pop("hooks", None)
+    if removed:
+        _save_settings(settings)
+        print(f"Removed {removed} claude-watch hook(s) from {SETTINGS_PATH}")
+    else:
+        print(f"No claude-watch hooks found in {SETTINGS_PATH}")
+    remove_agent()
+    print(f"\nState and history are still in {WATCH_HOME}. Delete that "
+          "directory to forget everything.")
+    return 0
+
+
+def cmd_doctor(args: list[str]) -> int:
+    cfg = load_config()
+    settings = _load_settings()
+    installed = sorted({
+        event
+        for event, entries in settings.get("hooks", {}).items()
+        if isinstance(entries, list)
+        for entry in entries
+        if isinstance(entry, dict)
+        for hook in entry.get("hooks", [])
+        if isinstance(hook, dict) and _is_ours(hook)
+    })
+
+    print(f"claude-watch {VERSION}")
+    print(f"  script:        {SELF}")
+    print(f"  state dir:     {WATCH_HOME}")
+    print(f"  settings:      {SETTINGS_PATH}")
+    print(f"  hooks:         {', '.join(installed) if installed else 'NOT INSTALLED'}")
+    missing = [e for e, _ in HOOK_MATCHERS if e not in installed]
+    if installed and missing:
+        print(f"  missing hooks: {', '.join(missing)} (re-run `claude-watch install`)")
+
+    notifier = chosen_notifier(cfg)
+    print(f"  notifier:      {notifier}" + (
+        "" if notifier != "osascript"
+        else "  (needs Script Editor notifications enabled)"))
+    print(f"  terminal-notifier: {shutil.which('terminal-notifier') or 'not installed'}")
+    print(f"  speak aloud:   {cfg.get('speak')}")
+    print(f"  re-notify:     every {cfg['renag_seconds']}s, "
+          f"up to {cfg['renag_max']} reminder(s)")
+
+    agent = subprocess.run(["launchctl", "print",
+                            f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
+                           capture_output=True, text=True)
+    print(f"  reminder agent: {'loaded' if agent.returncode == 0 else 'not loaded'}")
+
+    sessions = with_state()["sessions"]
+    waiting = sum(1 for s in sessions.values() if s.get("status") == "waiting")
+    print(f"  tracked:       {len(sessions)} session(s), {waiting} waiting")
+    if ERROR_PATH.exists():
+        tail = ERROR_PATH.read_text().splitlines()[-3:]
+        if tail:
+            print("  recent errors:")
+            for line in tail:
+                print(f"    {line}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# dispatch
+# --------------------------------------------------------------------------
+
+USAGE = """claude-watch: know when a Claude Code session is waiting on you
+
+  claude-watch install [--no-daemon]   register hooks (and the reminder agent)
+  claude-watch uninstall               remove the hooks and the agent
+  claude-watch status [--json]         what is waiting on you right now
+  claude-watch log [-n N] [--json]     history of waits and how long they took
+  claude-watch focus <n|id|project>    bring that session's terminal to the front
+  claude-watch test                    send a sample notification
+  claude-watch config                  show the config file and its path
+  claude-watch doctor                  check the installation
+  claude-watch clear                   forget all tracked sessions
+  claude-watch daemon [--interval N]   run the reminder loop in the foreground
+  claude-watch reap [--verbose]        one reminder/cleanup pass (used by launchd)
+  claude-watch hook                    hook entry point (reads JSON on stdin)
+"""
+
+COMMANDS = {
+    "install": cmd_install,
+    "uninstall": cmd_uninstall,
+    "status": cmd_status,
+    "log": cmd_log,
+    "history": cmd_log,
+    "focus": cmd_focus,
+    "test": cmd_test,
+    "config": cmd_config,
+    "doctor": cmd_doctor,
+    "clear": cmd_clear,
+    "daemon": cmd_daemon,
+    "reap": cmd_reap,
+    "hook": cmd_hook,
+}
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    if argv[0] in ("-v", "--version", "version"):
+        print(f"claude-watch {VERSION}")
+        return 0
+    command = COMMANDS.get(argv[0])
+    if command is None:
+        print(f"unknown command: {argv[0]}\n")
+        print(USAGE)
+        return 2
+    return command(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
