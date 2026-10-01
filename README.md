@@ -6,8 +6,8 @@ Claude Code fires a `Notification` hook whenever a session stalls: a permission
 prompt that has sat unanswered for ~6 seconds, an idle prompt ~60 seconds after
 Claude finished talking, an MCP server asking for input, a paused usage limit.
 `claude-watch` registers itself on that hook, remembers which sessions are
-blocked and for how long, sends a macOS notification, and keeps reminding you
-until you deal with it.
+blocked and for how long, sends a desktop notification, and keeps reminding you
+until you deal with it. It runs on macOS and Windows.
 
 It tracks every session at once, so three terminals in three projects stay
 distinguishable — each notification names the project, and `claude-watch status`
@@ -64,6 +64,36 @@ prompts for permission properly), it collapses repeat notifications for the same
 session instead of stacking them, and **clicking a notification jumps straight to
 the terminal window that is blocked**.
 
+## Windows
+
+Same script, same commands. From PowerShell or Command Prompt, in the folder you
+cloned into:
+
+```
+.\claude-watch.cmd install
+.\claude-watch.cmd test
+```
+
+`claude-watch.cmd` is a two-line wrapper that runs the script with `python`, so
+Python 3.9+ has to be on your `PATH`. What is different from macOS:
+
+- **Notifications** are Windows toasts, sent through the built-in Windows
+  PowerShell. They show up under the name "Windows PowerShell" in the
+  notification centre, and screen readers announce them. If nothing appears,
+  check **Settings → System → Notifications** and that Do Not Disturb is off.
+- **Reminders** come from a Task Scheduler job named `claude-watch` instead of
+  launchd. Task Scheduler cannot repeat faster than once a minute, so a reminder
+  can land up to a minute late.
+- **Sounds** are toast sound events (`Notification.Default`,
+  `Notification.Reminder`, `Notification.IM`, `Notification.Mail`,
+  `Notification.SMS`) rather than macOS sound names.
+- **`speak`** uses the Windows speech synthesizer; `voice` takes an installed
+  voice name such as `"Microsoft Zira Desktop"`.
+- **`focus`** raises the terminal window the session lives in, but cannot pick
+  the right tab inside Windows Terminal. Clicking a toast does not focus
+  anything.
+- **`notifier`** is `auto` (toast) or `none`.
+
 ## Commands
 
 | Command | What it does |
@@ -80,7 +110,7 @@ the terminal window that is blocked**.
 | `claude-watch install` / `uninstall` | Register / remove the hooks |
 
 `focus` takes the number from `status`, a session id prefix, or a project name.
-It works with Apple Terminal, iTerm2, and tmux panes.
+On macOS it works with Apple Terminal, iTerm2, and tmux panes.
 
 Example:
 
@@ -102,12 +132,12 @@ $ claude-watch status
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `notify` | see below | Per notification type: show a desktop notification or not |
-| `sounds` | `Ping` / `Tink` / `Glass` | macOS sound per type; `""` for silent, `default` covers the rest |
-| `speak` | `false` | Also announce the notification aloud with `say` |
+| `sounds` | `Ping` / `Tink` / `Glass` | Sound per type (macOS names shown; see Windows above); `""` for silent, `default` covers the rest |
+| `speak` | `false` | Also announce the notification aloud |
 | `voice` | `""` | Voice for `speak`, e.g. `"Samantha"`; empty uses the system voice |
 | `renag_seconds` | `120` | Remind you every N seconds while a session stays blocked; `0` disables |
 | `renag_max` | `4` | Stop after this many reminders |
-| `notifier` | `"auto"` | `auto`, `terminal-notifier`, `osascript`, or `none` |
+| `notifier` | `"auto"` | `auto`, `terminal-notifier`, `osascript`, or `none` (Windows: `auto` or `none`) |
 | `notify_on_stop` | `false` | Notify every time Claude finishes responding, not just when it idles |
 | `stale_session_seconds` | `86400` | Forget sessions that have gone quiet this long |
 
@@ -167,6 +197,6 @@ Two properties the hook path is built around:
 
 ## Requirements
 
-macOS, Python 3.9+, Claude Code v2.1.198 or later for the `agent_needs_input`
+macOS or Windows 10/11, Python 3.9+, Claude Code v2.1.198 or later for the `agent_needs_input`
 and `agent_completed` notification types (everything else works on older
-versions). `terminal-notifier` optional but recommended.
+versions). On macOS, `terminal-notifier` is optional but recommended.

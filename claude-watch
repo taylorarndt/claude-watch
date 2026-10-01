@@ -4,8 +4,8 @@
 Claude Code fires a `Notification` hook whenever a session stalls on a
 permission prompt, an idle prompt, or an MCP dialog. This utility registers
 itself on that hook (plus a few lifecycle events), keeps a record of which
-sessions are blocked and for how long, and sends a macOS notification, re-notifying
-while a session stays blocked.
+sessions are blocked and for how long, and sends a desktop notification (macOS
+or Windows), re-notifying while a session stays blocked.
 
   claude-watch install      register the hooks in ~/.claude/settings.json
   claude-watch status       what is waiting on you right now
@@ -17,7 +17,7 @@ Run `claude-watch help` for the full list.
 
 from __future__ import annotations
 
-import fcntl
+import base64
 import json
 import os
 import plistlib
@@ -26,8 +26,18 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "1.0.0"
+IS_WINDOWS = os.name == "nt"
+
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+else:
+    import fcntl
+
+VERSION = "1.1.0"
 
 SELF = Path(__file__).resolve()
 HOME = Path.home()
@@ -42,6 +52,9 @@ WAITING_MARKER = WATCH_HOME / "waiting"
 SETTINGS_PATH = HOME / ".claude" / "settings.json"
 LAUNCH_AGENT_LABEL = "com.taylorarndt.claude-watch"
 LAUNCH_AGENT_PATH = HOME / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+TASK_NAME = "claude-watch"
+# Toasts need a registered app id to post under; Windows PowerShell's is always there.
+TOAST_APP_ID = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe"
 
 # Notification types that mean a human has to do something. Everything else
 # Claude Code can emit is informational.
@@ -86,22 +99,30 @@ DEFAULT_CONFIG = {
         "quota_auto_resume_stale": True,
         "quota_auto_resume_disabled": True,
     },
-    # macOS system sound per type; "" for silent. "default" covers the rest.
+    # System sound per type; "" for silent. "default" covers the rest. macOS
+    # takes a sound name, Windows a toast sound event (Notification.*).
     "sounds": {
+        "permission_prompt": "Notification.Reminder",
+        "idle_prompt": "Notification.IM",
+        "agent_completed": "Notification.Mail",
+        "quota_auto_resume_stale": "Notification.Reminder",
+        "default": "Notification.Default",
+    } if IS_WINDOWS else {
         "permission_prompt": "Ping",
         "idle_prompt": "Tink",
         "agent_completed": "Glass",
         "quota_auto_resume_stale": "Basso",
         "default": "Ping",
     },
-    # Speak the notification aloud with `say` as well as showing it.
+    # Speak the notification aloud as well as showing it.
     "speak": False,
     "voice": "",
     # Re-notify every N seconds while a session stays blocked (0 disables).
     "renag_seconds": 120,
     # Give up re-notifying after this many reminders.
     "renag_max": 4,
-    # "auto" prefers terminal-notifier when installed, else osascript.
+    # "auto" is a toast on Windows; on macOS it prefers terminal-notifier
+    # when installed, else osascript.
     "notifier": "auto",
     # Forget sessions we have heard nothing from for this long.
     "stale_session_seconds": 86400,
@@ -117,7 +138,7 @@ DEFAULT_CONFIG = {
 def load_config() -> dict:
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     try:
-        user = json.loads(CONFIG_PATH.read_text())
+        user = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return cfg
     for key, value in user.items():
@@ -150,11 +171,33 @@ def _write_state(state: dict) -> None:
         WAITING_MARKER.unlink(missing_ok=True)
 
 
+# msvcrt locks a byte range rather than a file. Locking one far past the end
+# keeps the lock from ever colliding with someone reading the real contents.
+_LOCK_OFFSET = 1 << 30
+
+
+def _lock(fh) -> None:
+    if IS_WINDOWS:
+        fh.seek(_LOCK_OFFSET)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+
+
+def _unlock(fh) -> None:
+    fh.flush()
+    if IS_WINDOWS:
+        fh.seek(_LOCK_OFFSET)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def with_state(mutate=None):
     """Run `mutate(state)` under an exclusive lock, persisting any changes."""
     WATCH_HOME.mkdir(parents=True, exist_ok=True)
     with open(LOCK_PATH, "a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _lock(lock)
         try:
             state = _read_state()
             if mutate is None:
@@ -163,22 +206,69 @@ def with_state(mutate=None):
             _write_state(state)
             return result
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            _unlock(lock)
 
 
 def log_event(record: dict) -> None:
     WATCH_HOME.mkdir(parents=True, exist_ok=True)
     record.setdefault("at", time.time())
     with open(EVENTS_PATH, "a") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        fh.write(json.dumps(record) + "\n")
+        _lock(fh)
+        try:
+            fh.write(json.dumps(record) + "\n")
+        finally:
+            _unlock(fh)
 
 
 # --------------------------------------------------------------------------
 # process / terminal discovery
 # --------------------------------------------------------------------------
 
+def _kernel32():
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _proc_table_windows() -> dict[int, tuple[int, str, str]]:
+    class Entry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = _kernel32()
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    for walk in (kernel32.Process32FirstW, kernel32.Process32NextW):
+        walk.argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot in (None, wintypes.HANDLE(-1).value):
+        return {}
+    table: dict[int, tuple[int, str, str]] = {}
+    entry = Entry()
+    entry.dwSize = ctypes.sizeof(Entry)
+    try:
+        more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            table[entry.th32ProcessID] = (entry.th32ParentProcessID, "", entry.szExeFile)
+            more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return table
+
+
 def _proc_table() -> dict[int, tuple[int, str, str]]:
+    if IS_WINDOWS:
+        return _proc_table_windows()
     try:
         out = subprocess.run(
             ["ps", "-Ao", "pid=,ppid=,tty=,comm="],
@@ -216,7 +306,9 @@ def terminal_identity() -> dict:
         ppid, raw_tty, comm = row
         if tty is None and raw_tty not in ("??", "-", ""):
             tty = raw_tty
-        if claude_pid is None and "claude" in os.path.basename(comm).lower():
+        name = os.path.basename(comm).lower()
+        # An npm-installed Claude Code shows up as node.exe on Windows.
+        if claude_pid is None and ("claude" in name or (IS_WINDOWS and name == "node.exe")):
             claude_pid = pid
         if ppid <= 1:
             break
@@ -224,7 +316,8 @@ def terminal_identity() -> dict:
     return {
         "pid": claude_pid,
         "tty": f"/dev/{tty}" if tty else None,
-        "term_app": os.environ.get("TERM_PROGRAM", ""),
+        "term_app": os.environ.get("TERM_PROGRAM")
+        or ("WindowsTerminal" if os.environ.get("WT_SESSION") else ""),
         "term_session_id": os.environ.get("TERM_SESSION_ID")
         or os.environ.get("ITERM_SESSION_ID", ""),
         "tmux_pane": os.environ.get("TMUX_PANE", ""),
@@ -234,6 +327,23 @@ def terminal_identity() -> dict:
 def pid_alive(pid) -> bool:
     if not pid:
         return True  # unknown: assume alive, let the staleness sweep handle it
+    if IS_WINDOWS:
+        # Not os.kill(pid, 0): on Windows signal 0 is CTRL_C_EVENT.
+        kernel32 = _kernel32()
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        try:
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        except (ValueError, OverflowError, ctypes.ArgumentError):
+            return True
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such pid
+        code = wintypes.DWORD()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return not ok or code.value == 259  # STILL_ACTIVE
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
@@ -247,15 +357,20 @@ def pid_alive(pid) -> bool:
 # notifications
 # --------------------------------------------------------------------------
 
-def _spawn(cmd: list[str]) -> None:
+def _spawn(cmd: list[str], env: dict | None = None) -> None:
     """Fire and forget -- a hook must never block Claude Code."""
+    detach = {"start_new_session": True}
+    if IS_WINDOWS:
+        detach = {"creationflags": subprocess.CREATE_NO_WINDOW
+                  | subprocess.CREATE_NEW_PROCESS_GROUP}
     try:
         subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            env={**os.environ, **env} if env else None,
+            **detach,
         )
     except OSError as exc:
         _note_error(f"spawn failed: {cmd[0]}: {exc}")
@@ -265,12 +380,60 @@ def chosen_notifier(cfg: dict) -> str:
     choice = cfg.get("notifier", "auto")
     if choice != "auto":
         return choice
+    if IS_WINDOWS:
+        return "toast"
     return "terminal-notifier" if shutil.which("terminal-notifier") else "osascript"
+
+
+# Text reaches these scripts through the environment rather than being
+# interpolated, so quotes and newlines in a message cannot break them.
+TOAST_SCRIPT = '''
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+function Esc($s) { [System.Security.SecurityElement]::Escape($s) }
+if ($env:CW_SOUND) { $audio = '<audio src="ms-winsoundevent:' + (Esc $env:CW_SOUND) + '"/>' }
+else { $audio = '<audio silent="true"/>' }
+$body = '<toast><visual><binding template="ToastGeneric"><text>' + (Esc $env:CW_TITLE) +
+  '</text><text>' + (Esc $env:CW_SUBTITLE) + '</text><text>' + (Esc $env:CW_MESSAGE) +
+  '</text></binding></visual>' + $audio + '</toast>'
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($body)
+$toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+if ($env:CW_GROUP) { $toast.Tag = $env:CW_GROUP; $toast.Group = 'claude-watch' }
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:CW_APPID).Show($toast)
+'''
+
+SPEAK_SCRIPT = '''
+Add-Type -AssemblyName System.Speech
+$voice = New-Object System.Speech.Synthesis.SpeechSynthesizer
+if ($env:CW_VOICE) { $voice.SelectVoice($env:CW_VOICE) }
+$voice.Speak($env:CW_TEXT)
+'''
+
+
+def _powershell(script: str, env: dict) -> None:
+    # Windows PowerShell 5.1 specifically: PowerShell 7 cannot load WinRT types.
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    _spawn(["powershell.exe", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], env)
 
 
 def notify(cfg: dict, *, title: str, subtitle: str, message: str,
            group: str = "", sound: str = "", click: str = "") -> None:
     kind = chosen_notifier(cfg)
+    if IS_WINDOWS:
+        if kind != "none":
+            if sound and not sound.startswith("Notification."):
+                sound = "Notification.Default"  # e.g. a macOS sound name in the config
+            _powershell(TOAST_SCRIPT, {
+                "CW_TITLE": title, "CW_SUBTITLE": subtitle, "CW_MESSAGE": message,
+                "CW_SOUND": sound, "CW_GROUP": group[:64], "CW_APPID": TOAST_APP_ID,
+            })
+        if cfg.get("speak"):
+            spoken = f"{title}. {subtitle}. {message}" if subtitle else f"{title}. {message}"
+            _powershell(SPEAK_SCRIPT, {"CW_TEXT": spoken, "CW_VOICE": cfg.get("voice") or ""})
+        return
+
     if kind != "none":
         if kind == "terminal-notifier":
             cmd = ["terminal-notifier", "-title", title,
@@ -409,7 +572,54 @@ end run
 '''
 
 
+def _focus_windows(sess: dict) -> str:
+    """Raise the window of the nearest ancestor of the session that has one."""
+    pid = sess.get("pid")
+    if not pid:
+        return "no process recorded for this session"
+    table = _proc_table()
+    ancestors = []
+    for _ in range(12):
+        ancestors.append(pid)
+        row = table.get(pid)
+        if row is None or row[0] <= 0:
+            break
+        pid = row[0]
+
+    user32 = ctypes.WinDLL("user32")
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback, wintypes.LPARAM]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    for fn in (user32.IsWindowVisible, user32.GetWindowTextLengthW,
+               user32.IsIconic, user32.SetForegroundWindow):
+        fn.argtypes = [wintypes.HWND]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+
+    windows: dict[int, int] = {}
+
+    def each(hwnd, _):
+        if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd):
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            windows.setdefault(owner.value, hwnd)
+        return True
+
+    user32.EnumWindows(callback(each), 0)
+    for pid in ancestors:
+        hwnd = windows.get(pid)
+        if hwnd:
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            if user32.SetForegroundWindow(hwnd):
+                return "focused"
+            return "Windows would not hand over focus; the window's taskbar button is flashing"
+    return "could not find a terminal window for this session"
+
+
 def focus_session(sess: dict) -> str:
+    if IS_WINDOWS:
+        return _focus_windows(sess)
+
     pane = sess.get("tmux_pane")
     if pane and shutil.which("tmux"):
         subprocess.run(["tmux", "select-pane", "-t", pane],
@@ -447,7 +657,7 @@ def _session_defaults(sess: dict, payload: dict) -> None:
     sess["permission_mode"] = payload.get("permission_mode", sess.get("permission_mode"))
     sess["transcript_path"] = payload.get("transcript_path", sess.get("transcript_path"))
     sess["updated"] = time.time()
-    if not sess.get("tty"):
+    if not sess.get("tty") and not sess.get("pid"):
         sess.update(terminal_identity())
 
 
@@ -568,7 +778,7 @@ def hook_stop(cfg: dict, payload: dict) -> None:
 
 
 def cmd_hook(args: list[str]) -> int:
-    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    raw = "" if sys.stdin.isatty() else sys.stdin.buffer.read().decode("utf-8", "replace")
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except ValueError:
@@ -842,7 +1052,19 @@ HOOK_MATCHERS = [
     ("UserPromptSubmit", ""),
 ]
 
-HOOK_COMMAND = f"{shell_quote(str(SELF))} hook"
+
+def _windows_command(*parts: str) -> str:
+    # The script has no extension, so it runs through the interpreter. Bare
+    # forward-slash paths read the same in Git Bash, cmd and PowerShell; quotes
+    # are added only when a space forces them.
+    parts = tuple(p.replace("\\", "/") for p in parts)
+    return " ".join(f'"{p}"' if " " in p else p for p in parts)
+
+
+if IS_WINDOWS:
+    HOOK_COMMAND = _windows_command(sys.executable, str(SELF)) + " hook"
+else:
+    HOOK_COMMAND = f"{shell_quote(str(SELF))} hook"
 
 
 def write_default_config() -> None:
@@ -882,7 +1104,7 @@ def _strip_our_hooks(hooks: dict) -> int:
 
 def _load_settings() -> dict:
     try:
-        return json.loads(SETTINGS_PATH.read_text())
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except ValueError as exc:
@@ -898,7 +1120,7 @@ def _save_settings(settings: dict) -> None:
         shutil.copy2(SETTINGS_PATH, backup)
         print(f"Backed up settings to {backup}")
     tmp = SETTINGS_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     tmp.replace(SETTINGS_PATH)
 
 
@@ -928,7 +1150,7 @@ def cmd_install(args: list[str]) -> int:
     else:
         install_agent()
 
-    if not shutil.which("terminal-notifier"):
+    if not IS_WINDOWS and not shutil.which("terminal-notifier"):
         print("\nTip: `brew install terminal-notifier` gives you clickable "
               "notifications (clicking one jumps to that terminal window) and "
               "avoids the Script Editor permission dance.")
@@ -937,7 +1159,76 @@ def cmd_install(args: list[str]) -> int:
     return 0
 
 
+TASK_XML = '''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+'''
+
+
+def _install_task() -> None:
+    """The Windows reminder agent: a Task Scheduler job that reaps every minute."""
+    # pythonw runs without a console, so the task does not flash a window.
+    python = Path(sys.executable)
+    windowless = python.with_name("pythonw.exe")
+    if windowless.exists():
+        python = windowless
+
+    # From XML because the command-line flags cannot turn off "only on AC
+    # power", which would silence reminders on a laptop running on battery.
+    xml_path = WATCH_HOME / "task.xml"
+    WATCH_HOME.mkdir(parents=True, exist_ok=True)
+    xml_path.write_text(TASK_XML.format(command=xml_escape(str(python)),
+                                        arguments=xml_escape(f'"{SELF}" reap')),
+                        encoding="utf-16")
+    result = subprocess.run(["schtasks", "/Create", "/TN", TASK_NAME,
+                             "/XML", str(xml_path), "/F"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        result = subprocess.run(["schtasks", "/Create", "/TN", TASK_NAME, "/SC", "MINUTE",
+                                 "/MO", "1", "/TR", f'"{python}" "{SELF}" reap', "/F"],
+                                capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"Created scheduled task ({TASK_NAME}): re-notifies every "
+              f"{DEFAULT_CONFIG['renag_seconds']}s while a session stays blocked.")
+    else:
+        print(f"Could not create the scheduled task: "
+              f"{(result.stderr or result.stdout).strip()}")
+        print(f"Run it yourself with: {_windows_command(sys.executable, str(SELF))} daemon")
+
+
 def install_agent() -> None:
+    if IS_WINDOWS:
+        return _install_task()
     plist = {
         "Label": LAUNCH_AGENT_LABEL,
         "ProgramArguments": [str(SELF), "reap"],
@@ -967,6 +1258,12 @@ def install_agent() -> None:
 
 
 def remove_agent() -> None:
+    if IS_WINDOWS:
+        result = subprocess.run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"Removed scheduled task ({TASK_NAME})")
+        return
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
                    capture_output=True, text=True)
     if LAUNCH_AGENT_PATH.exists():
@@ -1017,14 +1314,19 @@ def cmd_doctor(args: list[str]) -> int:
     print(f"  notifier:      {notifier}" + (
         "" if notifier != "osascript"
         else "  (needs Script Editor notifications enabled)"))
-    print(f"  terminal-notifier: {shutil.which('terminal-notifier') or 'not installed'}")
+    if not IS_WINDOWS:
+        print(f"  terminal-notifier: {shutil.which('terminal-notifier') or 'not installed'}")
     print(f"  speak aloud:   {cfg.get('speak')}")
     print(f"  re-notify:     every {cfg['renag_seconds']}s, "
           f"up to {cfg['renag_max']} reminder(s)")
 
-    agent = subprocess.run(["launchctl", "print",
-                            f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
-                           capture_output=True, text=True)
+    if IS_WINDOWS:
+        agent = subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME],
+                               capture_output=True, text=True)
+    else:
+        agent = subprocess.run(["launchctl", "print",
+                                f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
+                               capture_output=True, text=True)
     print(f"  reminder agent: {'loaded' if agent.returncode == 0 else 'not loaded'}")
 
     sessions = with_state()["sessions"]
@@ -1055,7 +1357,7 @@ USAGE = """claude-watch: know when a Claude Code session is waiting on you
   claude-watch doctor                  check the installation
   claude-watch clear                   forget all tracked sessions
   claude-watch daemon [--interval N]   run the reminder loop in the foreground
-  claude-watch reap [--verbose]        one reminder/cleanup pass (used by launchd)
+  claude-watch reap [--verbose]        one reminder/cleanup pass (used by the agent)
   claude-watch hook                    hook entry point (reads JSON on stdin)
 """
 
@@ -1077,6 +1379,9 @@ COMMANDS = {
 
 
 def main(argv: list[str]) -> int:
+    if IS_WINDOWS:
+        # A legacy console code page must not turn a stray character into a crash.
+        sys.stdout.reconfigure(errors="replace")
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(USAGE)
         return 0
