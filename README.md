@@ -6,8 +6,8 @@ Claude Code fires a `Notification` hook whenever a session stalls: a permission
 prompt that has sat unanswered for ~6 seconds, an idle prompt ~60 seconds after
 Claude finished talking, an MCP server asking for input, a paused usage limit.
 `claude-watch` registers itself on that hook, remembers which sessions are
-blocked and for how long, sends a desktop notification, and keeps reminding you
-until you deal with it. It runs on macOS. Windows support is experimental and
+blocked and for how long, sends a desktop notification, and reminds you a few
+more times, further apart each time, if you do not get to it. It runs on macOS. Windows support is experimental and
 untested (see [Windows](#windows-experimental-untested)).
 
 It tracks every session at once, so three terminals in three projects stay
@@ -19,8 +19,8 @@ tells you which window to go to.
 This started because Michael wanted a way to get notified when Claude needs
 you. Claude Code will happily sit on a permission prompt in a background
 terminal for an hour while you assume it is still working. `claude-watch` is the
-answer to that: it tells you the moment a session is waiting, and keeps telling
-you until you go back to it.
+answer to that: it tells you the moment a session is waiting, and reminds you a
+few times if you do not go back to it.
 
 ## Install
 
@@ -141,8 +141,15 @@ $ claude-watch status
 | `sounds` | `Ping` / `Tink` / `Glass` | Sound per type (macOS names shown; see Windows above); `""` for silent, `default` covers the rest |
 | `speak` | `false` | Also announce the notification aloud |
 | `voice` | `""` | Voice for `speak`, e.g. `"Samantha"`; empty uses the system voice |
-| `renag_seconds` | `120` | Remind you every N seconds while a session stays blocked; `0` disables |
-| `renag_max` | `4` | Stop after this many reminders |
+| `renag_seconds` | `300` | First reminder comes N seconds after the notification; `0` disables reminders |
+| `renag_backoff` | `2` | Each later reminder waits this many times longer than the last; `1` keeps the gap fixed |
+| `renag_max` | `3` | Stop after this many reminders |
+
+With the defaults, a prompt you do not answer reminds you 5, 15, and 35 minutes
+after the first notification, then goes quiet.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
 | `notifier` | `"auto"` | `auto`, `terminal-notifier`, `osascript`, or `none` (Windows: `auto` or `none`) |
 | `notify_on_stop` | `false` | Notify every time Claude finishes responding, not just when it idles |
 | `stale_session_seconds` | `86400` | Forget sessions that have gone quiet this long |

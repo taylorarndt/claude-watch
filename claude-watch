@@ -37,7 +37,7 @@ if IS_WINDOWS:
 else:
     import fcntl
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 SELF = Path(__file__).resolve()
 HOME = Path.home()
@@ -117,10 +117,13 @@ DEFAULT_CONFIG = {
     # Speak the notification aloud as well as showing it.
     "speak": False,
     "voice": "",
-    # Re-notify every N seconds while a session stays blocked (0 disables).
-    "renag_seconds": 120,
+    # First reminder comes this long after the notification (0 disables).
+    "renag_seconds": 300,
+    # Each later reminder waits this many times longer than the one before,
+    # so a prompt you cannot get to stops nagging. 1 keeps the gap fixed.
+    "renag_backoff": 2,
     # Give up re-notifying after this many reminders.
-    "renag_max": 4,
+    "renag_max": 3,
     # "auto" is a toast on Windows; on macOS it prefers terminal-notifier
     # when installed, else osascript.
     "notifier": "auto",
@@ -828,7 +831,9 @@ def cmd_reap(args: list[str]) -> int:
                 continue
             if sess.get("notify_count", 0) > cfg.get("renag_max", 0):
                 continue
-            if now - sess.get("last_notified", 0) >= renag:
+            sent = max(0, sess.get("notify_count", 1) - 1)
+            gap = renag * max(1, cfg.get("renag_backoff", 1)) ** sent
+            if now - sess.get("last_notified", 0) >= gap:
                 sess["last_notified"] = now
                 sess["notify_count"] = sess.get("notify_count", 0) + 1
                 reminders.append(dict(sess))
@@ -1218,8 +1223,8 @@ def _install_task() -> None:
                                  "/MO", "1", "/TR", f'"{python}" "{SELF}" reap', "/F"],
                                 capture_output=True, text=True)
     if result.returncode == 0:
-        print(f"Created scheduled task ({TASK_NAME}): re-notifies every "
-              f"{DEFAULT_CONFIG['renag_seconds']}s while a session stays blocked.")
+        print(f"Created scheduled task ({TASK_NAME}): sends reminders while a "
+              "session stays blocked.")
     else:
         print(f"Could not create the scheduled task: "
               f"{(result.stderr or result.stdout).strip()}")
@@ -1249,8 +1254,8 @@ def install_agent() -> None:
         result = subprocess.run(["launchctl", "load", "-w", str(LAUNCH_AGENT_PATH)],
                                 capture_output=True, text=True)
     if result.returncode == 0:
-        print(f"Loaded reminder agent ({LAUNCH_AGENT_LABEL}): re-notifies every "
-              f"{DEFAULT_CONFIG['renag_seconds']}s while a session stays blocked.")
+        print(f"Loaded reminder agent ({LAUNCH_AGENT_LABEL}): sends reminders "
+              "while a session stays blocked.")
     else:
         print(f"Could not load the reminder agent: "
               f"{(result.stderr or result.stdout).strip()}")
@@ -1317,8 +1322,8 @@ def cmd_doctor(args: list[str]) -> int:
     if not IS_WINDOWS:
         print(f"  terminal-notifier: {shutil.which('terminal-notifier') or 'not installed'}")
     print(f"  speak aloud:   {cfg.get('speak')}")
-    print(f"  re-notify:     every {cfg['renag_seconds']}s, "
-          f"up to {cfg['renag_max']} reminder(s)")
+    print(f"  re-notify:     after {cfg['renag_seconds']}s, gap x{cfg['renag_backoff']} "
+          f"each time, up to {cfg['renag_max']} reminder(s)")
 
     if IS_WINDOWS:
         agent = subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME],
