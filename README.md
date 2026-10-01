@@ -13,6 +13,14 @@ It tracks every session at once, so three terminals in three projects stay
 distinguishable — each notification names the project, and `claude-watch status`
 tells you which window to go to.
 
+## Why this exists
+
+This started because Michael wanted a way to get notified when Claude needs
+you. Claude Code will happily sit on a permission prompt in a background
+terminal for an hour while you assume it is still working. `claude-watch` is the
+answer to that: it tells you the moment a session is waiting, and keeps telling
+you until you go back to it.
+
 ## Install
 
 ```sh
