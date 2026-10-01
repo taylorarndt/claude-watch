@@ -1,0 +1,48 @@
+name: Windows test report
+description: Tell us how claude-watch behaved on a real Windows machine
+labels: ["windows"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The Windows port has not been run on Windows by its author. A report of what worked and what did not is a real contribution, even if everything worked.
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: setup
+    attributes:
+      label: Terminal, Python version, and how Claude Code is installed
+      placeholder: Windows Terminal with PowerShell 7, Python 3.12, native installer
+    validations:
+      required: true
+  - type: checkboxes
+    id: worked
+    attributes:
+      label: What worked
+      options:
+        - label: "`claude-watch.cmd install` finished without errors"
+        - label: "`claude-watch.cmd test` showed a toast notification"
+        - label: A real permission prompt produced a notification
+        - label: A reminder arrived while a session stayed blocked
+        - label: "`claude-watch.cmd status` listed the session"
+        - label: "`claude-watch.cmd focus 1` raised the terminal window"
+        - label: A screen reader announced the notification
+  - type: textarea
+    id: failed
+    attributes:
+      label: What did not work
+      description: Include any error text exactly as it appeared.
+    validations:
+      required: false
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `claude-watch.cmd doctor`
+      render: text
+    validations:
+      required: true

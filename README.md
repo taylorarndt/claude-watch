@@ -7,7 +7,8 @@ prompt that has sat unanswered for ~6 seconds, an idle prompt ~60 seconds after
 Claude finished talking, an MCP server asking for input, a paused usage limit.
 `claude-watch` registers itself on that hook, remembers which sessions are
 blocked and for how long, sends a desktop notification, and keeps reminding you
-until you deal with it. It runs on macOS and Windows.
+until you deal with it. It runs on macOS. Windows support is experimental and
+untested (see [Windows](#windows-experimental-untested)).
 
 It tracks every session at once, so three terminals in three projects stay
 distinguishable — each notification names the project, and `claude-watch status`
@@ -64,7 +65,12 @@ prompts for permission properly), it collapses repeat notifications for the same
 session instead of stacking them, and **clicking a notification jumps straight to
 the terminal window that is blocked**.
 
-## Windows
+## Windows (experimental, untested)
+
+**The Windows port is experimental. It has never been run on a real Windows
+machine.** It was written on a Mac, and only the macOS side has been tested.
+Expect rough edges, and please file a *Windows test report* issue saying what
+worked and what did not.
 
 Same script, same commands. From PowerShell or Command Prompt, in the folder you
 cloned into:
@@ -197,6 +203,21 @@ Two properties the hook path is built around:
 
 ## Requirements
 
-macOS or Windows 10/11, Python 3.9+, Claude Code v2.1.198 or later for the `agent_needs_input`
+macOS (tested) or Windows 10/11 (experimental, untested), Python 3.9+, Claude Code v2.1.198 or later for the `agent_needs_input`
 and `agent_completed` notification types (everything else works on older
 versions). On macOS, `terminal-notifier` is optional but recommended.
+
+## Contributing
+
+Bug reports, Windows test reports, and pull requests are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md), the [Code of Conduct](CODE_OF_CONDUCT.md),
+and [SUPPORT.md](SUPPORT.md). Report security problems privately as described
+in [SECURITY.md](SECURITY.md).
+
+## Contributors
+
+<a href="https://github.com/taylorarndt/claude-watch/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=taylorarndt/claude-watch" alt="Profile pictures of the people who have contributed to claude-watch" />
+</a>
+
+Made with [contrib.rocks](https://contrib.rocks).
