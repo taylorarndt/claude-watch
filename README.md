@@ -43,27 +43,26 @@ your other settings untouched.
 
 ### Make notifications actually appear
 
-By default this shells out to `osascript`, which routes notifications through
-the built-in Script Editor app. If Script Editor does not have notification
-permission, **the command fails silently** — macOS never prompts. One-time fix:
+On install, `claude-watch` builds a small app of its own at
+`~/.claude-watch/Claude Watch.app` and posts notifications from it. The first
+one makes macOS ask whether to allow notifications from **Claude Watch**; say
+yes. If you miss the prompt, turn it on under **System Settings →
+Notifications → Claude Watch**.
 
-```sh
-osascript -e 'display notification "test"'   # nothing appears yet
-```
+**Clicking a notification jumps to the terminal window of the session that is
+waiting.** Nothing else opens and there is nothing to pick. The first click
+makes macOS ask whether Claude Watch may control your terminal app, which is
+how it brings the window forward.
 
-Then open **System Settings → Notifications**, find **Script Editor**, and turn
-on *Allow Notifications*.
-
-Better option:
+Optional:
 
 ```sh
 brew install terminal-notifier
 ```
 
-`claude-watch` picks it up automatically. It has its own app bundle (so macOS
-prompts for permission properly), it collapses repeat notifications for the same
-session instead of stacking them, and **clicking a notification jumps straight to
-the terminal window that is blocked**.
+`claude-watch` picks it up automatically. It collapses repeat notifications for
+the same session instead of stacking them, and a click goes to the exact
+session that notification was about, rather than the latest one waiting.
 
 ## Windows (experimental, untested)
 
@@ -116,6 +115,7 @@ Python 3.9+ has to be on your `PATH`. What is different from macOS:
 | `claude-watch install` / `uninstall` | Register / remove the hooks |
 
 `focus` takes the number from `status`, a session id prefix, or a project name.
+With no argument it picks the session that notified you most recently.
 On macOS it works with Apple Terminal, iTerm2, and tmux panes.
 
 Example:
@@ -150,7 +150,7 @@ after the first notification, then goes quiet.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `notifier` | `"auto"` | `auto`, `terminal-notifier`, `osascript`, or `none` (Windows: `auto` or `none`) |
+| `notifier` | `"auto"` | `auto`, `terminal-notifier`, `app`, `osascript`, or `none` (Windows: `auto` or `none`) |
 | `notify_on_stop` | `false` | Notify every time Claude finishes responding, not just when it idles |
 | `stale_session_seconds` | `86400` | Forget sessions that have gone quiet this long |
 
@@ -212,7 +212,7 @@ Two properties the hook path is built around:
 
 macOS (tested) or Windows 10/11 (experimental, untested), Python 3.9+, Claude Code v2.1.198 or later for the `agent_needs_input`
 and `agent_completed` notification types (everything else works on older
-versions). On macOS, `terminal-notifier` is optional but recommended.
+versions). On macOS, `terminal-notifier` is optional.
 
 ## Contributing
 

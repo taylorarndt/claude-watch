@@ -28,8 +28,9 @@ Knowing this helps you judge what counts as a vulnerability:
   Nothing is sent over the network.
 - It installs a background job (a launchd agent on macOS, a Task Scheduler job
   on Windows) that runs as you, with no elevated privileges.
-- It starts `osascript`, `terminal-notifier`, or Windows PowerShell to show
-  notifications. Notification text is passed as arguments or environment
+- It starts its own notifier app (built locally with `osacompile` into
+  `~/.claude-watch/`), `terminal-notifier`, `osascript`, or Windows PowerShell
+  to show notifications. Notification text is passed as arguments or environment
   variables, never interpolated into a script.
 
 Anything that lets hook input run commands, write outside `~/.claude-watch/`,

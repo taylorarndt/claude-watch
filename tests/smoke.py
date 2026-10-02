@@ -64,6 +64,9 @@ check("reap keeps a live session", len(sessions()) == 1)
 run("status")
 run("doctor")
 
+bare = subprocess.run([sys.executable, str(SCRIPT), "focus"], capture_output=True, text=True)
+check("focus with no argument picks the waiting session", bare.returncode == 0, bare.stdout.strip())
+
 hook("PostToolUse")
 check("tool use clears the wait", sessions()[0].get("status") == "idle")
 check("marker file is removed", not Path(home, "waiting").exists())
@@ -86,6 +89,12 @@ check("this process counts as alive", cw.pid_alive(os.getpid()))
 child = subprocess.Popen([sys.executable, "-c", "pass"])
 child.wait()
 check("an exited process counts as dead", not cw.pid_alive(child.pid))
+
+if sys.platform == "darwin":
+    binary = cw.notifier_binary()
+    check("notifier app builds", binary is not None and binary.exists())
+    check("notifier app is reused once built", cw.notifier_binary() == binary
+          and not Path(home, "errors.log").exists())
 
 if "--install" in sys.argv:
     print(run("install"))

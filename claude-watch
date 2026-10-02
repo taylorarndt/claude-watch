@@ -10,7 +10,7 @@ or Windows), re-notifying while a session stays blocked.
   claude-watch install      register the hooks in ~/.claude/settings.json
   claude-watch status       what is waiting on you right now
   claude-watch log          history of waits, with how long each one took
-  claude-watch focus <n>    bring a blocked session's terminal to the front
+  claude-watch focus [n]    bring a blocked session's terminal to the front
 
 Run `claude-watch help` for the full list.
 """
@@ -37,7 +37,7 @@ if IS_WINDOWS:
 else:
     import fcntl
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 SELF = Path(__file__).resolve()
 HOME = Path.home()
@@ -53,6 +53,10 @@ SETTINGS_PATH = HOME / ".claude" / "settings.json"
 LAUNCH_AGENT_LABEL = "com.taylorarndt.claude-watch"
 LAUNCH_AGENT_PATH = HOME / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 TASK_NAME = "claude-watch"
+# macOS files a notification under the app that posted it and opens that app on
+# a click, so we post from a small app of our own rather than Script Editor.
+NOTIFIER_APP = WATCH_HOME / "Claude Watch.app"
+NOTIFIER_BUNDLE_ID = f"{LAUNCH_AGENT_LABEL}.notifier"
 # Toasts need a registered app id to post under; Windows PowerShell's is always there.
 TOAST_APP_ID = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe"
 
@@ -125,7 +129,7 @@ DEFAULT_CONFIG = {
     # Give up re-notifying after this many reminders.
     "renag_max": 3,
     # "auto" is a toast on Windows; on macOS it prefers terminal-notifier
-    # when installed, else osascript.
+    # when installed, else claude-watch's own notifier app.
     "notifier": "auto",
     # Forget sessions we have heard nothing from for this long.
     "stale_session_seconds": 86400,
@@ -385,7 +389,68 @@ def chosen_notifier(cfg: dict) -> str:
         return choice
     if IS_WINDOWS:
         return "toast"
-    return "terminal-notifier" if shutil.which("terminal-notifier") else "osascript"
+    return "terminal-notifier" if shutil.which("terminal-notifier") else "app"
+
+
+# Launched with a message in the environment, the app posts it. Launched bare,
+# which is what clicking one of its notifications does, it focuses the session
+# that is waiting.
+NOTIFIER_SOURCE = '''ObjC.import('Foundation');
+function run() {
+  const env = $.NSProcessInfo.processInfo.environment;
+  const get = k => { const v = env.objectForKey(k); return v.isNil() ? '' : v.js; };
+  const app = Application.currentApplication();
+  app.includeStandardAdditions = true;
+  const message = get('CW_MESSAGE');
+  if (!message) {
+    try { app.doShellScript(%s); } catch (e) {}
+    return;
+  }
+  const opts = {withTitle: get('CW_TITLE'), subtitle: get('CW_SUBTITLE')};
+  if (get('CW_SOUND')) opts.soundName = get('CW_SOUND');
+  app.displayNotification(message, opts);
+  delay(1);
+}
+'''
+
+
+def notifier_binary() -> Path | None:
+    """Path to the notifier app's executable, building the app if needed."""
+    focus = f"{shell_quote(sys.executable)} {shell_quote(str(SELF))} focus"
+    source = NOTIFIER_SOURCE % json.dumps(focus)
+    binary = NOTIFIER_APP / "Contents" / "MacOS" / "applet"
+    stamp = NOTIFIER_APP / "Contents" / "Resources" / "source.js"
+    try:
+        if binary.exists() and stamp.read_text(encoding="utf-8") == source:
+            return binary
+    except OSError:
+        pass
+
+    WATCH_HOME.mkdir(parents=True, exist_ok=True)
+    script = WATCH_HOME / "notifier.js"
+    info = str(NOTIFIER_APP / "Contents" / "Info.plist")
+    try:
+        script.write_text(source, encoding="utf-8")
+        shutil.rmtree(NOTIFIER_APP, ignore_errors=True)
+        for cmd in (
+            ["osacompile", "-l", "JavaScript", "-o", str(NOTIFIER_APP), str(script)],
+            ["plutil", "-replace", "CFBundleIdentifier", "-string", NOTIFIER_BUNDLE_ID, info],
+            # No Dock icon when it launches to post or to handle a click.
+            ["plutil", "-replace", "LSUIElement", "-bool", "true", info],
+        ):
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        stamp.write_text(source, encoding="utf-8")
+        # Editing the bundle broke the signature osacompile gave it.
+        subprocess.run(["codesign", "--force", "-s", "-", str(NOTIFIER_APP)],
+                       check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = (getattr(exc, "stderr", "") or "").strip()
+        _note_error(f"could not build notifier app: {exc} {detail}".rstrip())
+        shutil.rmtree(NOTIFIER_APP, ignore_errors=True)
+        return None
+    finally:
+        script.unlink(missing_ok=True)
+    return binary
 
 
 # Text reaches these scripts through the environment rather than being
@@ -438,7 +503,12 @@ def notify(cfg: dict, *, title: str, subtitle: str, message: str,
         return
 
     if kind != "none":
-        if kind == "terminal-notifier":
+        binary = notifier_binary() if kind == "app" else None
+        if binary:
+            # Text goes through the environment, as with the Windows toast.
+            _spawn([str(binary)], {"CW_TITLE": title, "CW_SUBTITLE": subtitle,
+                                   "CW_MESSAGE": message, "CW_SOUND": sound})
+        elif kind == "terminal-notifier":
             cmd = ["terminal-notifier", "-title", title,
                    "-subtitle", subtitle, "-message", message]
             if sound:
@@ -459,7 +529,8 @@ def notify(cfg: dict, *, title: str, subtitle: str, message: str,
             cmd = ["osascript", "-e", script, "--", message, title, subtitle]
             if sound:
                 cmd.append(sound)
-        _spawn(cmd)
+        if not binary:
+            _spawn(cmd)
 
     if cfg.get("speak"):
         spoken = f"{title}. {subtitle}. {message}" if subtitle else f"{title}. {message}"
@@ -986,17 +1057,22 @@ def cmd_log(args: list[str]) -> int:
 
 
 def cmd_focus(args: list[str]) -> int:
-    if not args:
-        print("usage: claude-watch focus <number | session-id | project>")
-        return 2
-    target = args[0]
     sessions = ordered_sessions(with_state())
     if not sessions:
         print("No sessions tracked.")
         return 1
 
+    # No target: the session whose notification is the newest, which is the
+    # one a click on a notification is most likely about.
+    target = args[0] if args else ""
     match = None
-    if target.isdigit() and 1 <= int(target) <= len(sessions):
+    if not args:
+        waiting = [s for s in sessions if s.get("status") == "waiting"]
+        if not waiting:
+            print("No session is waiting. Try `claude-watch status`.")
+            return 1
+        match = max(waiting, key=lambda s: s.get("last_notified", 0))
+    elif target.isdigit() and 1 <= int(target) <= len(sessions):
         match = sessions[int(target) - 1]
     else:
         for sess in sessions:
@@ -1155,10 +1231,14 @@ def cmd_install(args: list[str]) -> int:
     else:
         install_agent()
 
-    if not IS_WINDOWS and not shutil.which("terminal-notifier"):
-        print("\nTip: `brew install terminal-notifier` gives you clickable "
-              "notifications (clicking one jumps to that terminal window) and "
-              "avoids the Script Editor permission dance.")
+    if not IS_WINDOWS and chosen_notifier(load_config()) == "app":
+        if notifier_binary():
+            print(f"Built the notifier app at {NOTIFIER_APP}: notifications come "
+                  "from \"Claude Watch\", and clicking one jumps to the waiting "
+                  "session. Allow them when macOS asks.")
+        else:
+            print(f"Could not build the notifier app (see {ERROR_PATH}); "
+                  "falling back to osascript.")
     print("\nOpen a new Claude Code session to pick the hooks up, then run "
           "`claude-watch status`.")
     return 0
@@ -1274,6 +1354,9 @@ def remove_agent() -> None:
     if LAUNCH_AGENT_PATH.exists():
         LAUNCH_AGENT_PATH.unlink()
         print(f"Removed {LAUNCH_AGENT_PATH}")
+    if NOTIFIER_APP.exists():
+        shutil.rmtree(NOTIFIER_APP, ignore_errors=True)
+        print(f"Removed {NOTIFIER_APP}")
 
 
 def cmd_uninstall(args: list[str]) -> int:
@@ -1316,9 +1399,10 @@ def cmd_doctor(args: list[str]) -> int:
         print(f"  missing hooks: {', '.join(missing)} (re-run `claude-watch install`)")
 
     notifier = chosen_notifier(cfg)
-    print(f"  notifier:      {notifier}" + (
-        "" if notifier != "osascript"
-        else "  (needs Script Editor notifications enabled)"))
+    print(f"  notifier:      {notifier}" + {
+        "app": f"  ({NOTIFIER_APP}{'' if NOTIFIER_APP.exists() else ', not built yet'})",
+        "osascript": "  (posts as Script Editor; clicking one opens Script Editor)",
+    }.get(notifier, ""))
     if not IS_WINDOWS:
         print(f"  terminal-notifier: {shutil.which('terminal-notifier') or 'not installed'}")
     print(f"  speak aloud:   {cfg.get('speak')}")
@@ -1356,7 +1440,8 @@ USAGE = """claude-watch: know when a Claude Code session is waiting on you
   claude-watch uninstall               remove the hooks and the agent
   claude-watch status [--json]         what is waiting on you right now
   claude-watch log [-n N] [--json]     history of waits and how long they took
-  claude-watch focus <n|id|project>    bring that session's terminal to the front
+  claude-watch focus [n|id|project]    bring that session's terminal to the front
+                                       (no argument: the latest one waiting)
   claude-watch test                    send a sample notification
   claude-watch config                  show the config file and its path
   claude-watch doctor                  check the installation
